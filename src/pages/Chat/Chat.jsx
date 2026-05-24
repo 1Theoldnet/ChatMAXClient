@@ -2,16 +2,23 @@ import React, { useState, useEffect, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import axios from 'axios'
 import io from 'socket.io-client'
+import Peer from 'peerjs'
 import { 
   FaArrowLeft, FaPaperPlane, FaSun, FaMoon, FaTrash, 
   FaPhone, FaVideo, FaEllipsisV, FaEraser, FaUsers, 
   FaCrown, FaMicrophone, FaMicrophoneSlash, FaVideoSlash, 
-  FaPhoneSlash, FaImage, FaFileAudio, FaFileVideo, FaTimes,
-  FaPlay, FaPause
+  FaPhoneSlash, FaImage, FaFileAudio, FaFileVideo, FaPaperclip,
+  FaPlay, FaPause, FaStop, FaFile
 } from 'react-icons/fa'
 import './ChatStyle.scss'
 
 const API_URL = 'https://chatmax-1.onrender.com'
+const PEER_CONFIG = {
+  host: 'chatmax-1.onrender.com',
+  port: 3001,
+  path: '/peerjs',
+  secure: true
+}
 
 function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
   const { chatId } = useParams()
@@ -20,6 +27,8 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
   const [messages, setMessages] = useState([])
   const [newMessage, setNewMessage] = useState('')
   const [socket, setSocket] = useState(null)
+  const [peer, setPeer] = useState(null)
+  const [myPeerId, setMyPeerId] = useState(null)
   const messagesEndRef = useRef(null)
   const [typing, setTyping] = useState(false)
   const [typingUser, setTypingUser] = useState(null)
@@ -29,41 +38,48 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
   const [showDeleteMenu, setShowDeleteMenu] = useState(false)
   const [showMembersModal, setShowMembersModal] = useState(false)
   const [selectedMessageId, setSelectedMessageId] = useState(null)
+  const [showAttachmentMenu, setShowAttachmentMenu] = useState(false)
   
   // Состояния для медиафайлов
-  const [selectedFile, setSelectedFile] = useState(null)
-  const [fileType, setFileType] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [playingAudioId, setPlayingAudioId] = useState(null)
   const audioRefs = useRef({})
+  
+  // Состояния для голосовых сообщений
+  const [isRecording, setIsRecording] = useState(false)
+  const [recordingTime, setRecordingTime] = useState(0)
+  const [mediaRecorder, setMediaRecorder] = useState(null)
+  const recordingTimerRef = useRef(null)
   
   // Состояния для звонков
   const [isCalling, setIsCalling] = useState(false)
   const [incomingCall, setIncomingCall] = useState(null)
   const [callType, setCallType] = useState(null)
-  const [currentCallId, setCurrentCallId] = useState(null)
+  const [currentCall, setCurrentCall] = useState(null)
   const [isMuted, setIsMuted] = useState(false)
   const [isVideoOff, setIsVideoOff] = useState(false)
   const [localStream, setLocalStream] = useState(null)
   const [remoteStream, setRemoteStream] = useState(null)
   
-  // Refs для WebRTC
+  // Refs
   const localVideoRef = useRef(null)
   const remoteVideoRef = useRef(null)
-  const peerConnectionRef = useRef(null)
   const fileInputRef = useRef(null)
+  const attachmentMenuRef = useRef(null)
   
   const isMounted = useRef(true)
   const loadChatDataRef = useRef(false)
 
-  // Конфигурация WebRTC
-  const configuration = {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' }
-    ]
-  }
+  // Закрытие меню при клике вне его
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (attachmentMenuRef.current && !attachmentMenuRef.current.contains(event.target)) {
+        setShowAttachmentMenu(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
 
   useEffect(() => {
     isMounted.current = true
@@ -72,11 +88,53 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop())
       }
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close()
+      if (currentCall) {
+        currentCall.close()
+      }
+      if (peer) {
+        peer.destroy()
+      }
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current)
       }
     }
   }, [])
+
+  // Инициализация PeerJS
+  useEffect(() => {
+    if (!currentUser) return
+    
+    const peerInstance = new Peer(currentUser.id.toString(), PEER_CONFIG)
+    
+    peerInstance.on('open', (id) => {
+      console.log('My Peer ID:', id)
+      setMyPeerId(id)
+      
+      // Обновляем пользователя с peerId
+      const updatedUser = { ...currentUser, peerId: id }
+      setCurrentUser(updatedUser)
+      localStorage.setItem('user', JSON.stringify(updatedUser))
+    })
+    
+    peerInstance.on('call', (call) => {
+      console.log('Incoming call from:', call.peer)
+      setIncomingCall({
+        call: call,
+        from: call.peer,
+        isVideo: call.metadata?.isVideo || false
+      })
+    })
+    
+    peerInstance.on('error', (err) => {
+      console.error('Peer error:', err)
+    })
+    
+    setPeer(peerInstance)
+    
+    return () => {
+      peerInstance.destroy()
+    }
+  }, [currentUser?.id])
 
   useEffect(() => {
     if (!currentUser) {
@@ -92,7 +150,6 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
     setSocket(newSocket)
     newSocket.emit('user-connected', currentUser.id)
     
-    // Обработчики сообщений
     newSocket.on('new-message', (data) => {
       if (data.chatId === parseInt(chatId) && isMounted.current) {
         setMessages(prev => [...prev, data.message])
@@ -126,52 +183,24 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
       }
     })
     
-    // Обработчики звонков (WebRTC)
-    newSocket.on('incoming-call', (data) => {
-      if (data.chatId === parseInt(chatId)) {
-        setIncomingCall(data)
+    // PeerJS сигнальные сообщения через Socket.IO
+    newSocket.on('peer-call-answered', (data) => {
+      if (data.callId === currentCall?.callId && currentCall) {
+        console.log('Call answered')
       }
     })
     
-    newSocket.on('call-answered', (data) => {
-      if (data.chatId === parseInt(chatId)) {
-        createOffer()
-      }
-    })
-    
-    newSocket.on('call-rejected', (data) => {
+    newSocket.on('peer-call-rejected', (data) => {
       if (data.chatId === parseInt(chatId)) {
         alert('Звонок отклонен')
         endCall()
       }
     })
     
-    newSocket.on('call-ended', (data) => {
+    newSocket.on('peer-call-ended', (data) => {
       if (data.chatId === parseInt(chatId)) {
         alert('Звонок завершен')
         endCall()
-      }
-    })
-    
-    newSocket.on('webrtc-offer', async (data) => {
-      if (data.callId === currentCallId) {
-        await handleOffer(data.offer)
-      }
-    })
-    
-    newSocket.on('webrtc-answer', async (data) => {
-      if (data.callId === currentCallId && peerConnectionRef.current) {
-        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.answer))
-      }
-    })
-    
-    newSocket.on('webrtc-ice-candidate', async (data) => {
-      if (data.callId === currentCallId && peerConnectionRef.current) {
-        try {
-          await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate))
-        } catch (err) {
-          console.error('Error adding ICE candidate:', err)
-        }
       }
     })
     
@@ -186,30 +215,272 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
         newSocket.off('message-deleted')
         newSocket.off('user-typing')
         newSocket.off('user-status-changed')
-        newSocket.off('incoming-call')
-        newSocket.off('call-answered')
-        newSocket.off('call-rejected')
-        newSocket.off('call-ended')
-        newSocket.off('webrtc-offer')
-        newSocket.off('webrtc-answer')
-        newSocket.off('webrtc-ice-candidate')
+        newSocket.off('peer-call-answered')
+        newSocket.off('peer-call-rejected')
+        newSocket.off('peer-call-ended')
         newSocket.close()
       }
     }
   }, [chatId])
+
+  // ============ ФУНКЦИИ ДЛЯ ЗВОНКОВ (PeerJS) ============
+  
+  const startCall = async (isVideo) => {
+    if (chat?.isGroup) {
+      alert('Групповые звонки пока не поддерживаются')
+      return
+    }
+    
+    if (!peer) {
+      alert('Подключение к серверу не установлено')
+      return
+    }
+    
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert('Ваш браузер не поддерживает аудио/видео звонки')
+      return
+    }
+    
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: isVideo,
+        audio: true
+      })
+      
+      setLocalStream(stream)
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream
+      }
+      
+      const targetPeerId = chat.user.peerId || chat.user.id.toString()
+      
+      const call = peer.call(targetPeerId, stream, {
+        metadata: { isVideo, from: currentUser.id }
+      })
+      
+      call.on('stream', (remoteStream) => {
+        setRemoteStream(remoteStream)
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = remoteStream
+        }
+      })
+      
+      call.on('close', () => {
+        endCall()
+      })
+      
+      call.on('error', (err) => {
+        console.error('Call error:', err)
+        alert('Ошибка при звонке')
+        endCall()
+      })
+      
+      setCurrentCall({ call, callId: `call_${Date.now()}` })
+      setCallType(isVideo ? 'video' : 'audio')
+      setIsCalling(true)
+      
+      socket?.emit('peer-call-initiated', {
+        from: currentUser.id,
+        to: chat.user.id,
+        chatId: parseInt(chatId),
+        isVideo: isVideo
+      })
+      
+    } catch (err) {
+      console.error('Error starting call:', err)
+      if (err.name === 'NotAllowedError') {
+        alert('Пожалуйста, разрешите доступ к микрофону и камере')
+      } else {
+        alert('Не удалось получить доступ к микрофону/камере')
+      }
+    }
+  }
+  
+  const acceptCall = async () => {
+    if (!incomingCall) return
+    
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: incomingCall.isVideo,
+        audio: true
+      })
+      
+      setLocalStream(stream)
+      if (localVideoRef.current && incomingCall.isVideo) {
+        localVideoRef.current.srcObject = stream
+      }
+      
+      const call = incomingCall.call
+      call.answer(stream)
+      
+      call.on('stream', (remoteStream) => {
+        setRemoteStream(remoteStream)
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = remoteStream
+        }
+      })
+      
+      call.on('close', () => {
+        endCall()
+      })
+      
+      setCurrentCall({ call, callId: `call_${Date.now()}` })
+      setCallType(incomingCall.isVideo ? 'video' : 'audio')
+      setIsCalling(true)
+      setIncomingCall(null)
+      
+      socket?.emit('peer-call-answered', {
+        to: currentUser.id,
+        chatId: parseInt(chatId)
+      })
+      
+    } catch (err) {
+      console.error('Error accepting call:', err)
+      alert('Не удалось получить доступ к микрофону/камере')
+      rejectCall()
+    }
+  }
+  
+  const rejectCall = () => {
+    if (incomingCall) {
+      incomingCall.call.close()
+      setIncomingCall(null)
+      
+      socket?.emit('peer-call-rejected', {
+        to: currentUser.id,
+        chatId: parseInt(chatId)
+      })
+    }
+  }
+  
+  const endCall = () => {
+    if (currentCall) {
+      currentCall.call.close()
+      setCurrentCall(null)
+    }
+    
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop())
+      setLocalStream(null)
+    }
+    
+    setRemoteStream(null)
+    setIsCalling(false)
+    setCallType(null)
+    setIsMuted(false)
+    setIsVideoOff(false)
+    
+    socket?.emit('peer-call-ended', {
+      chatId: parseInt(chatId),
+      userId: currentUser.id
+    })
+  }
+  
+  const toggleMute = () => {
+    if (localStream) {
+      const audioTrack = localStream.getAudioTracks()[0]
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled
+        setIsMuted(!audioTrack.enabled)
+      }
+    }
+  }
+  
+  const toggleVideo = () => {
+    if (localStream) {
+      const videoTrack = localStream.getVideoTracks()[0]
+      if (videoTrack) {
+        videoTrack.enabled = !videoTrack.enabled
+        setIsVideoOff(!videoTrack.enabled)
+      }
+    }
+  }
+  
+  const handleCall = () => startCall(false)
+  const handleVideoCall = () => startCall(true)
+
+  // ============ ФУНКЦИИ ДЛЯ ГОЛОСОВЫХ СООБЩЕНИЙ ============
+  
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const recorder = new MediaRecorder(stream)
+      const chunks = []
+      
+      recorder.ondataavailable = (e) => {
+        chunks.push(e.data)
+      }
+      
+      recorder.onstop = async () => {
+        const audioBlob = new Blob(chunks, { type: 'audio/webm' })
+        const reader = new FileReader()
+        reader.onloadend = async () => {
+          await sendVoiceMessage(reader.result)
+        }
+        reader.readAsDataURL(audioBlob)
+        stream.getTracks().forEach(track => track.stop())
+      }
+      
+      recorder.start()
+      setMediaRecorder(recorder)
+      setIsRecording(true)
+      setRecordingTime(0)
+      
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1)
+      }, 1000)
+      
+    } catch (err) {
+      console.error('Error starting recording:', err)
+      alert('Не удалось получить доступ к микрофону')
+    }
+  }
+  
+  const stopRecording = () => {
+    if (mediaRecorder && isRecording) {
+      mediaRecorder.stop()
+      setIsRecording(false)
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current)
+      }
+    }
+  }
+  
+  const sendVoiceMessage = async (base64Audio) => {
+    try {
+      const endpoint = chat?.isGroup ? '/message/create/group' : '/message/create/no-group'
+      await axios.post(`${API_URL}${endpoint}`, {
+        userId: currentUser.id,
+        chatId: parseInt(chatId),
+        text: '',
+        audio: base64Audio
+      })
+    } catch (err) {
+      console.error('Error sending voice message:', err)
+      alert('Ошибка при отправке голосового сообщения')
+    }
+  }
+  
+  const formatTime = (seconds) => {
+    const mins = Math.floor(seconds / 60)
+    const secs = seconds % 60
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
+  }
 
   // ============ ФУНКЦИИ ДЛЯ МЕДИАФАЙЛОВ ============
   
   const handleFileSelect = (type) => {
     setFileType(type)
     fileInputRef.current?.click()
+    setShowAttachmentMenu(false)
   }
+  
+  const [fileType, setFileType] = useState(null)
   
   const handleFileChange = async (e) => {
     const file = e.target.files[0]
     if (!file) return
     
-    // Проверка размера файла (максимум 50MB)
     if (file.size > 50 * 1024 * 1024) {
       alert('Файл слишком большой. Максимальный размер 50MB')
       return
@@ -218,7 +489,6 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
     setUploading(true)
     
     try {
-      // Конвертируем файл в base64
       const reader = new FileReader()
       reader.onloadend = async () => {
         const base64Data = reader.result
@@ -229,20 +499,23 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
           text: ''
         }
         
-        // Добавляем соответствующий тип медиа
         if (fileType === 'photo') {
           messageData.photo = base64Data
         } else if (fileType === 'video') {
           messageData.video = base64Data
         } else if (fileType === 'audio') {
           messageData.audio = base64Data
+        } else if (fileType === 'file') {
+          messageData.file = {
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            data: base64Data
+          }
         }
         
         const endpoint = chat?.isGroup ? '/message/create/group' : '/message/create/no-group'
         await axios.post(`${API_URL}${endpoint}`, messageData)
-        
-        setSelectedFile(null)
-        setFileType(null)
       }
       reader.readAsDataURL(file)
     } catch (err) {
@@ -262,7 +535,6 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
         setPlayingAudioId(null)
       }
     } else {
-      // Останавливаем текущее аудио
       if (playingAudioId && audioRefs.current[playingAudioId]) {
         audioRefs.current[playingAudioId].pause()
       }
@@ -295,8 +567,9 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
     }
     
     if (message.audio) {
+      const isVoiceNote = message.audio.length < 500000
       return (
-        <div className="message-audio">
+        <div className={`message-audio ${isVoiceNote ? 'voice-note' : ''}`}>
           <audio 
             ref={el => audioRefs.current[message.id] = el}
             src={message.audio} 
@@ -308,239 +581,36 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
           >
             {playingAudioId === message.id ? <FaPause /> : <FaPlay />}
           </button>
-          <div className="audio-wave">
-            <span></span><span></span><span></span><span></span><span></span>
-          </div>
+          {isVoiceNote && (
+            <div className="audio-wave">
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+          )}
           <span className="audio-duration">
-            {message.duration || 'Аудио'}
+            {isVoiceNote ? 'Голосовое сообщение' : 'Аудио'}
           </span>
+        </div>
+      )
+    }
+    
+    if (message.file) {
+      const fileSize = (message.file.size / 1024 / 1024).toFixed(2)
+      return (
+        <div className="message-file">
+          <FaFile />
+          <div className="file-info">
+            <span className="file-name">{message.file.name}</span>
+            <span className="file-size">{fileSize} MB</span>
+          </div>
+          <a href={message.file.data} download={message.file.name} className="download-file">
+            Скачать
+          </a>
         </div>
       )
     }
     
     return null
   }
-
-  // ============ ФУНКЦИИ ЗВОНКОВ (WebRTC) ============
-  
-  const startCall = async (isVideo) => {
-    if (chat?.isGroup) {
-      alert('Групповые звонки пока не поддерживаются')
-      return
-    }
-    
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      alert('Ваш браузер не поддерживает аудио/видео звонки')
-      return
-    }
-    
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: isVideo,
-        audio: true
-      })
-      
-      setLocalStream(stream)
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream
-      }
-      
-      const peerConnection = new RTCPeerConnection(configuration)
-      peerConnectionRef.current = peerConnection
-      
-      stream.getTracks().forEach(track => {
-        peerConnection.addTrack(track, stream)
-      })
-      
-      peerConnection.ontrack = (event) => {
-        const remoteStream = event.streams[0]
-        setRemoteStream(remoteStream)
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = remoteStream
-        }
-      }
-      
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate && currentCallId) {
-          socket?.emit('webrtc-ice-candidate', {
-            callId: currentCallId,
-            to: chat.user.id,
-            candidate: event.candidate
-          })
-        }
-      }
-      
-      const callId = `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-      setCurrentCallId(callId)
-      setCallType(isVideo ? 'video' : 'audio')
-      setIsCalling(true)
-      
-      socket?.emit('call-user', {
-        from: currentUser.id,
-        to: chat.user.id,
-        chatId: parseInt(chatId),
-        isVideo: isVideo
-      })
-      
-    } catch (err) {
-      console.error('Error starting call:', err)
-      alert('Не удалось получить доступ к микрофону/камере')
-    }
-  }
-  
-  const createOffer = async () => {
-    if (!peerConnectionRef.current) return
-    
-    try {
-      const offer = await peerConnectionRef.current.createOffer()
-      await peerConnectionRef.current.setLocalDescription(offer)
-      
-      socket?.emit('webrtc-offer', {
-        callId: currentCallId,
-        to: chat.user.id,
-        offer: offer
-      })
-    } catch (err) {
-      console.error('Error creating offer:', err)
-    }
-  }
-  
-  const handleOffer = async (offer) => {
-    if (!peerConnectionRef.current) return
-    
-    try {
-      await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(offer))
-      const answer = await peerConnectionRef.current.createAnswer()
-      await peerConnectionRef.current.setLocalDescription(answer)
-      
-      socket?.emit('webrtc-answer', {
-        callId: currentCallId,
-        to: chat.user.id,
-        answer: answer
-      })
-    } catch (err) {
-      console.error('Error handling offer:', err)
-    }
-  }
-  
-  const acceptCall = async () => {
-    if (!incomingCall) return
-    
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: incomingCall.isVideo,
-        audio: true
-      })
-      
-      setLocalStream(stream)
-      if (localVideoRef.current && incomingCall.isVideo) {
-        localVideoRef.current.srcObject = stream
-      }
-      
-      const peerConnection = new RTCPeerConnection(configuration)
-      peerConnectionRef.current = peerConnection
-      
-      stream.getTracks().forEach(track => {
-        peerConnection.addTrack(track, stream)
-      })
-      
-      peerConnection.ontrack = (event) => {
-        const remoteStream = event.streams[0]
-        setRemoteStream(remoteStream)
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = remoteStream
-        }
-      }
-      
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate && incomingCall.callId) {
-          socket?.emit('webrtc-ice-candidate', {
-            callId: incomingCall.callId,
-            to: incomingCall.from,
-            candidate: event.candidate
-          })
-        }
-      }
-      
-      setCurrentCallId(incomingCall.callId)
-      setCallType(incomingCall.isVideo ? 'video' : 'audio')
-      setIsCalling(true)
-      
-      socket?.emit('answer-call', {
-        callId: incomingCall.callId,
-        from: incomingCall.from,
-        to: currentUser.id,
-        chatId: parseInt(chatId)
-      })
-      
-      setIncomingCall(null)
-      
-    } catch (err) {
-      console.error('Error accepting call:', err)
-      alert('Не удалось получить доступ к микрофону/камере')
-      rejectCall()
-    }
-  }
-  
-  const rejectCall = () => {
-    if (incomingCall) {
-      socket?.emit('reject-call', {
-        callId: incomingCall.callId,
-        from: incomingCall.from,
-        to: currentUser.id,
-        chatId: parseInt(chatId)
-      })
-      setIncomingCall(null)
-    }
-  }
-  
-  const endCall = () => {
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close()
-      peerConnectionRef.current = null
-    }
-    
-    if (localStream) {
-      localStream.getTracks().forEach(track => track.stop())
-      setLocalStream(null)
-    }
-    
-    if (currentCallId) {
-      socket?.emit('end-call', {
-        callId: currentCallId,
-        chatId: parseInt(chatId),
-        userId: currentUser.id
-      })
-    }
-    
-    setIsCalling(false)
-    setCallType(null)
-    setCurrentCallId(null)
-    setRemoteStream(null)
-  }
-  
-  const toggleMute = () => {
-    if (localStream) {
-      const audioTrack = localStream.getAudioTracks()[0]
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled
-        setIsMuted(!audioTrack.enabled)
-      }
-    }
-  }
-  
-  const toggleVideo = () => {
-    if (localStream) {
-      const videoTrack = localStream.getVideoTracks()[0]
-      if (videoTrack) {
-        videoTrack.enabled = !videoTrack.enabled
-        setIsVideoOff(!videoTrack.enabled)
-      }
-    }
-  }
-  
-  const handleCall = () => startCall(false)
-  const handleVideoCall = () => startCall(true)
 
   // ============ ОСТАЛЬНЫЕ ФУНКЦИИ ============
   
@@ -562,9 +632,11 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
       
       const res = await axios.get(`${API_URL}/user/${currentUser.id}`)
       if (res.data && res.data.id && isMounted.current) {
-        setCurrentUser(res.data)
+        const userData = { ...res.data, peerId: myPeerId }
+        setCurrentUser(userData)
+        localStorage.setItem('user', JSON.stringify(userData))
         
-        const currentChat = res.data.chats.find(c => c.id === parseInt(chatId))
+        const currentChat = userData.chats.find(c => c.id === parseInt(chatId))
         if (currentChat) {
           setChat(currentChat)
           setMessages(currentChat.messages || [])
@@ -840,65 +912,73 @@ function Chat({ toggleTheme, theme, currentUser, setCurrentUser }) {
       </div>
 
       <div className="message-input-container">
-        <div className="media-buttons">
-          <input
-            type="file"
-            ref={fileInputRef}
-            style={{ display: 'none' }}
-            accept="image/*"
-            onChange={handleFileChange}
-          />
+        <div className="attachment-wrapper" ref={attachmentMenuRef}>
           <button 
-            className="media-btn" 
-            onClick={() => handleFileSelect('photo')}
-            disabled={uploading}
-            title="Фото"
+            className={`attachment-btn ${showAttachmentMenu ? 'active' : ''}`}
+            onClick={() => setShowAttachmentMenu(!showAttachmentMenu)}
           >
-            <FaImage />
+            <FaPaperclip />
           </button>
           
-          <input
-            type="file"
-            ref={fileInputRef}
-            style={{ display: 'none' }}
-            accept="video/*"
-            onChange={handleFileChange}
-          />
-          <button 
-            className="media-btn" 
-            onClick={() => handleFileSelect('video')}
-            disabled={uploading}
-            title="Видео"
-          >
-            <FaFileVideo />
-          </button>
-          
-          <input
-            type="file"
-            ref={fileInputRef}
-            style={{ display: 'none' }}
-            accept="audio/*"
-            onChange={handleFileChange}
-          />
-          <button 
-            className="media-btn" 
-            onClick={() => handleFileSelect('audio')}
-            disabled={uploading}
-            title="Аудио"
-          >
-            <FaFileAudio />
-          </button>
+          <div className={`attachment-menu ${showAttachmentMenu ? 'show' : ''}`}>
+            <button onClick={() => handleFileSelect('photo')} className="attachment-item">
+              <FaImage style={{ color: '#4CAF50' }} />
+              <span>Фото</span>
+            </button>
+            <button onClick={() => handleFileSelect('video')} className="attachment-item">
+              <FaFileVideo style={{ color: '#2196F3' }} />
+              <span>Видео</span>
+            </button>
+            <button onClick={() => handleFileSelect('audio')} className="attachment-item">
+              <FaFileAudio style={{ color: '#FF9800' }} />
+              <span>Аудио</span>
+            </button>
+            <button onClick={() => handleFileSelect('file')} className="attachment-item">
+              <FaFile style={{ color: '#9C27B0' }} />
+              <span>Файл</span>
+            </button>
+          </div>
         </div>
         
         <input
-          type="text"
-          placeholder="Введите сообщение..."
-          value={newMessage}
-          onChange={handleTyping}
-          onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
-          disabled={uploading}
+          type="file"
+          ref={fileInputRef}
+          style={{ display: 'none' }}
+          accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.txt"
+          onChange={handleFileChange}
         />
-        <button onClick={handleSendMessage} disabled={!newMessage.trim() || uploading}>
+        
+        {isRecording ? (
+          <div className="recording-controls">
+            <span className="recording-timer">
+              <span className="recording-dot"></span>
+              {formatTime(recordingTime)}
+            </span>
+            <button className="stop-recording" onClick={stopRecording}>
+              <FaStop />
+            </button>
+          </div>
+        ) : (
+          <>
+            <input
+              type="text"
+              placeholder="Введите сообщение..."
+              value={newMessage}
+              onChange={handleTyping}
+              onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
+              disabled={uploading}
+            />
+            <button 
+              className="voice-message-btn" 
+              onClick={startRecording}
+              title="Голосовое сообщение"
+            >
+              <FaMicrophone />
+            </button>
+          </>
+        )}
+        
+        <button onClick={handleSendMessage} disabled={!newMessage.trim() || uploading || isRecording}>
           {uploading ? '...' : <FaPaperPlane />}
         </button>
       </div>
